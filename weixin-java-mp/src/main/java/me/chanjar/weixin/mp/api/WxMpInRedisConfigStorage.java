@@ -3,6 +3,9 @@ package me.chanjar.weixin.mp.api;
 import redis.clients.jedis.Jedis;
 import redis.clients.jedis.JedisPool;
 
+import java.util.ArrayList;
+import java.util.List;
+
 /**
  * 基于Redis的微信配置provider
  * <pre>
@@ -20,6 +23,23 @@ public class WxMpInRedisConfigStorage extends WxMpInMemoryConfigStorage {
 
   private final static String CARDAPI_TICKET_KEY = "wechat_cardapi_ticket_";
 
+  private final static String DISTRIBUTED_ACCESS_TOKEN_LOCK_KEY = "distributed_wechat_access_token_lock_";
+
+  /**
+   * lua script 脚本 这是一个分布式限流的lua脚本用在分布式锁上也不会有问题
+   */
+  private static StringBuffer locksb = new StringBuffer();
+  static{
+    locksb.append("local times = redis.call('incr',KEYS[1])");
+    locksb.append(" if times == 1 then");
+    locksb.append(" redis.call('expire',KEYS[1], ARGV[1])");
+    locksb.append(" end");
+    locksb.append(" if times > tonumber(ARGV[2]) then");
+    locksb.append(" return 0");
+    locksb.append(" end");
+    locksb.append(" return 1");
+  }
+
   /**
    * 使用连接池保证线程安全
    */
@@ -30,6 +50,8 @@ public class WxMpInRedisConfigStorage extends WxMpInMemoryConfigStorage {
   private String jsapiTicketKey;
 
   private String cardapiTicketKey;
+
+  private String distributedLockAccessTokenKey;
 
   public WxMpInRedisConfigStorage(JedisPool jedisPool) {
     this.jedisPool = jedisPool;
@@ -46,6 +68,7 @@ public class WxMpInRedisConfigStorage extends WxMpInMemoryConfigStorage {
     this.accessTokenKey = ACCESS_TOKEN_KEY.concat(appId);
     this.jsapiTicketKey = JSAPI_TICKET_KEY.concat(appId);
     this.cardapiTicketKey = CARDAPI_TICKET_KEY.concat(appId);
+    this.distributedLockAccessTokenKey = DISTRIBUTED_ACCESS_TOKEN_LOCK_KEY.concat(appId);
   }
 
   @Override
@@ -66,6 +89,8 @@ public class WxMpInRedisConfigStorage extends WxMpInMemoryConfigStorage {
   public synchronized void updateAccessToken(String accessToken, int expiresInSeconds) {
     try (Jedis jedis = this.jedisPool.getResource()) {
       jedis.setex(this.accessTokenKey, expiresInSeconds - 200, accessToken);
+      //更新AccessToken成功之后，解锁
+      this.redisDistributedUnLock();
     }
   }
 
@@ -129,6 +154,38 @@ public class WxMpInRedisConfigStorage extends WxMpInMemoryConfigStorage {
   public void expireCardApiTicket() {
     try (Jedis jedis = this.jedisPool.getResource()) {
       jedis.expire(this.cardapiTicketKey, 0);
+    }
+  }
+
+  /**
+   * 分布式锁-上锁
+   * @return
+   */
+  public boolean redisDistributedLock(){
+    Long lockSuccess = 1L;
+    try (Jedis jedis = this.jedisPool.getResource()) {
+      List<String> keys = new ArrayList<>();
+      keys.add(this.distributedLockAccessTokenKey);
+      List<String> args = new ArrayList<>();
+      //过期时间 6秒
+      args.add("6");
+      //次数 (6秒钟内只能执行一次，6秒钟足够更新缓存了)
+      args.add("1");
+      Object result = jedis.eval(locksb.toString(),keys,args);
+      if(lockSuccess.equals(result)){
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * 分布式锁-解锁
+   * @return
+   */
+  private void redisDistributedUnLock(){
+    try (Jedis jedis = this.jedisPool.getResource()) {
+      jedis.del(distributedLockAccessTokenKey);
     }
   }
 }

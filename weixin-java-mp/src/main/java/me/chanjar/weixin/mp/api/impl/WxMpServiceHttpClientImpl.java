@@ -8,6 +8,7 @@ import me.chanjar.weixin.common.util.http.HttpType;
 import me.chanjar.weixin.common.util.http.apache.ApacheHttpClientBuilder;
 import me.chanjar.weixin.common.util.http.apache.DefaultApacheHttpClientBuilder;
 import me.chanjar.weixin.mp.api.WxMpConfigStorage;
+import me.chanjar.weixin.mp.api.WxMpInRedisConfigStorage;
 import me.chanjar.weixin.mp.api.WxMpService;
 import org.apache.http.HttpHost;
 import org.apache.http.client.config.RequestConfig;
@@ -75,17 +76,39 @@ public class WxMpServiceHttpClientImpl extends BaseWxMpServiceImpl<CloseableHttp
             RequestConfig config = RequestConfig.custom().setProxy(this.getRequestHttpProxy()).build();
             httpGet.setConfig(config);
           }
-          try (CloseableHttpResponse response = getRequestHttpClient().execute(httpGet)) {
-            String resultContent = new BasicResponseHandler().handleResponse(response);
-            WxError error = WxError.fromJson(resultContent, WxType.MP);
-            if (error.getErrorCode() != 0) {
-              throw new WxErrorException(error);
+          //判断存储类的实例 如果是redisConfigStorage 则进行redis分布式 锁处理
+          if(this.getWxMpConfigStorage()instanceof WxMpInRedisConfigStorage){
+            //判断是否获取到锁，如果获取到锁直接进行accessToken的更新 否则抛出WxErrorException异常(上层类已经进行了重试故不在此处进行重试)
+            if (((WxMpInRedisConfigStorage) this.getWxMpConfigStorage()).redisDistributedLock()){
+              try (CloseableHttpResponse response = getRequestHttpClient().execute(httpGet)) {
+                String resultContent = new BasicResponseHandler().handleResponse(response);
+                WxError error = WxError.fromJson(resultContent, WxType.MP);
+                if (error.getErrorCode() != 0) {
+                  throw new WxErrorException(error);
+                }
+                WxAccessToken accessToken = WxAccessToken.fromJson(resultContent);
+                this.getWxMpConfigStorage().updateAccessToken(accessToken.getAccessToken(),
+                  accessToken.getExpiresIn());
+              } finally {
+                httpGet.releaseConnection();
+              }
+            }else{
+              WxError lockError = WxError.fromJson("{errorCode:500}");
+              throw new WxErrorException(lockError);
             }
-            WxAccessToken accessToken = WxAccessToken.fromJson(resultContent);
-            this.getWxMpConfigStorage().updateAccessToken(accessToken.getAccessToken(),
-              accessToken.getExpiresIn());
-          } finally {
-            httpGet.releaseConnection();
+          }else {
+            try (CloseableHttpResponse response = getRequestHttpClient().execute(httpGet)) {
+              String resultContent = new BasicResponseHandler().handleResponse(response);
+              WxError error = WxError.fromJson(resultContent, WxType.MP);
+              if (error.getErrorCode() != 0) {
+                throw new WxErrorException(error);
+              }
+              WxAccessToken accessToken = WxAccessToken.fromJson(resultContent);
+              this.getWxMpConfigStorage().updateAccessToken(accessToken.getAccessToken(),
+                accessToken.getExpiresIn());
+            } finally {
+              httpGet.releaseConnection();
+            }
           }
         } catch (IOException e) {
           throw new RuntimeException(e);
